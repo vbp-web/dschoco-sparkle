@@ -52,10 +52,16 @@ const Checkout = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    if (cartItems.length === 0) {
+      toast.error("Your cart is empty");
+      return;
+    }
+    
     setLoading(true);
 
     try {
-      // Create order
+      // Create order in database
       const { data: order, error: orderError } = await supabase
         .from("orders")
         .insert({
@@ -67,40 +73,92 @@ const Checkout = () => {
           shipping_city: formData.city,
           shipping_state: formData.state,
           shipping_pincode: formData.pincode,
+          status: 'pending',
         })
         .select()
         .single();
 
       if (orderError) throw orderError;
 
-      // Create order items
-      const orderItems = cartItems.map(item => ({
-        order_id: order.id,
-        product_id: item.product.id,
-        variant_id: item.variant.id,
-        quantity: item.quantity,
-        price_at_time: item.variant.price,
-        product_name: item.product.name,
-        variant_name: item.variant.variant_name,
-      }));
+      // Create Razorpay order
+      const { data: razorpayData, error: razorpayError } = await supabase.functions.invoke(
+        'create-razorpay-order',
+        {
+          body: {
+            amount: total,
+            orderId: order.id,
+          },
+        }
+      );
 
-      const { error: itemsError } = await supabase
-        .from("order_items")
-        .insert(orderItems);
+      if (razorpayError) {
+        console.error('Razorpay order creation failed:', razorpayError);
+        throw new Error('Payment initialization failed');
+      }
 
-      if (itemsError) throw itemsError;
+      // Initialize Razorpay payment
+      const options = {
+        key: razorpayData.keyId,
+        amount: razorpayData.amount,
+        currency: razorpayData.currency,
+        name: "D's Choco Bliss",
+        description: "Order Payment",
+        order_id: razorpayData.razorpayOrderId,
+        handler: async function (response: any) {
+          try {
+            // Create order items
+            const orderItems = cartItems.map(item => ({
+              order_id: order.id,
+              product_id: item.product.id,
+              variant_id: item.variant.id,
+              quantity: item.quantity,
+              price_at_time: item.variant.price,
+              product_name: item.product.name,
+              variant_name: item.variant.variant_name,
+            }));
 
-      // Clear cart
-      await supabase
-        .from("cart_items")
-        .delete()
-        .eq("user_id", user.id);
+            await supabase.from("order_items").insert(orderItems);
 
-      toast.success("Order placed successfully!");
-      navigate("/profile");
+            // Update order status
+            await supabase
+              .from("orders")
+              .update({ status: 'paid' })
+              .eq("id", order.id);
+
+            // Clear cart
+            await supabase
+              .from("cart_items")
+              .delete()
+              .eq("user_id", user.id);
+
+            toast.success("Payment successful! Order placed.");
+            navigate("/profile");
+          } catch (error) {
+            console.error('Post-payment error:', error);
+            toast.error("Order confirmation failed");
+          }
+        },
+        prefill: {
+          name: formData.name,
+          contact: formData.phone,
+        },
+        theme: {
+          color: "#8B4513",
+        },
+        modal: {
+          ondismiss: function() {
+            setLoading(false);
+            toast.error("Payment cancelled");
+          }
+        }
+      };
+
+      const razorpay = new (window as any).Razorpay(options);
+      razorpay.open();
+      
     } catch (error: any) {
-      toast.error("Failed to place order");
-    } finally {
+      console.error('Checkout error:', error);
+      toast.error(error.message || "Failed to process order");
       setLoading(false);
     }
   };
